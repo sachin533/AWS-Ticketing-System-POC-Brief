@@ -1,0 +1,22 @@
+{
+  "name": "ticketing-backend",
+  "version": "1.0.0",
+  "description": "AWS Lambda backend for Serverless Ticketing System (Node.js 20)",
+  "type": "commonjs",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test",
+    "package": "powershell Compress-Archive -Path src,package.json -DestinationPath function.zip -Force"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0",
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/s3-request-presigner": "^3.600.0",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {},
+  "engines": {
+    "node": ">=20"
+  }
+}

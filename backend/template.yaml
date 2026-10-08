@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless Ticketing System (Free-Tier friendly) - Lambda + HTTP API + DynamoDB + S3 + Cognito
+
+Parameters:
+  StageName:
+    Type: String
+    Default: dev
+  CorsOrigin:
+    Type: String
+    Default: http://localhost:5173
+    Description: Frontend origin allowed by CORS (set to your hosting URL in prod)
+
+Resources:
+  # ---------- DynamoDB (on-demand = Free Tier friendly) ----------
+  TicketsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub tickets-${StageName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ticketId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ticketId
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+
+  CommentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ticket-comments-${StageName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ticketId
+          AttributeType: S
+        - AttributeName: commentId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ticketId
+          KeyType: HASH
+        - AttributeName: commentId
+          KeyType: RANGE
+
+  # ---------- S3 attachments (private; access via presigned URLs only) ----------
+  AttachmentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ticket-attachments-${StageName}-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Suspended
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # ---------- Cognito User Pool + Hosted UI ----------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ticketing-users-${StageName}
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  AgentsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Agents
+      Description: Support agents (can update status/assignee, see all tickets)
+      UserPoolId: !Ref UserPool
+
+  CustomersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Customers
+      Description: Default customer role
+      UserPoolId: !Ref UserPool
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub ticketing-${StageName}-${AWS::AccountId}
+      UserPoolId: !Ref UserPool
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: ticketing-web-client
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false # public SPA client, PKCE only
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [email, openid, profile]
+      CallbackURLs:
+        - http://localhost:5173/callback
+        # ADD your production URL later, e.g. https://xyz.amplifyapp.com/callback
+      LogoutURLs:
+        - http://localhost:5173/
+      SupportedIdentityProviders: [COGNITO]
+      PreventUserExistenceErrors: ENABLED
+
+  # ---------- Lambda API ----------
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ticketing-api-${StageName}
+      Runtime: nodejs20.x
+      Handler: src/index.handler
+      CodeUri: ./
+      MemorySize: 256
+      Timeout: 15
+      Environment:
+        Variables:
+          TICKETS_TABLE: !Ref TicketsTable
+          COMMENTS_TABLE: !Ref CommentsTable
+          ATTACHMENTS_BUCKET: !Ref AttachmentsBucket
+          CORS_ORIGIN: !Ref CorsOrigin
+          PRESIGNED_URL_EXPIRES_IN: '300'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TicketsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CommentsTable
+        - S3CrudPolicy:
+            BucketName: !Ref AttachmentsBucket
+      Events:
+        CreateTicket:
+          Type: HttpApi
+          Properties:
+            Path: /tickets
+            Method: POST
+            Auth:
+              Authorizer: JwtAuthorizer
+        ListTickets:
+          Type: HttpApi
+          Properties:
+            Path: /tickets
+            Method: GET
+            Auth:
+              Authorizer: JwtAuthorizer
+        GetTicket:
+          Type: HttpApi
+          Properties:
+            Path: /tickets/{ticketId}
+            Method: GET
+            Auth:
+              Authorizer: JwtAuthorizer
+        UpdateTicket:
+          Type: HttpApi
+          Properties:
+            Path: /tickets/{ticketId}
+            Method: PUT
+            Auth:
+              Authorizer: JwtAuthorizer
+        AddComment:
+          Type: HttpApi
+          Properties:
+            Path: /tickets/{ticketId}/comments
+            Method: POST
+            Auth:
+              Authorizer: JwtAuthorizer
+        ListComments:
+          Type: HttpApi
+          Properties:
+            Path: /tickets/{ticketId}/comments
+            Method: GET
+            Auth:
+              Authorizer: JwtAuthorizer
+        PresignedUrl:
+          Type: HttpApi
+          Properties:
+            Path: /tickets/presigned-url
+            Method: POST
+            Auth:
+              Authorizer: JwtAuthorizer
+
+  # ---------- HTTP API + Cognito JWT authorizer ----------
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref StageName
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref CorsOrigin
+        AllowHeaders: [Content-Type, Authorization]
+        AllowMethods: [GET, POST, PUT, OPTIONS]
+        MaxAge: 600
+      Auth:
+        DefaultAuthorizer: JwtAuthorizer
+        Authorizers:
+          JwtAuthorizer:
+            JwtConfiguration:
+              audience:
+                - !Ref UserPoolClient
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+            IdentitySource: $request.header.Authorization
+            AuthorizationCredentialsArn: NONE
+
+Outputs:
+  ApiBaseUrl:
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Value: !Sub https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+  AttachmentsBucketName:
+    Value: !Ref AttachmentsBucket
